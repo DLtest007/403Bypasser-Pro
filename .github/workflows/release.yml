@@ -32,7 +32,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           # 指向 Maven 编译后生成的 jar 包路径
-          files: target/403Bypasser-1.0-SNAPSHOT.jar
+          files: target/*.jar
         env:
           # 使用 GitHub 自动提供的 Token 进行鉴权
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
