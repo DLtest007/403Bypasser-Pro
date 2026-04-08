@@ -30,7 +30,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
 
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
-    private final String extensionName = "403 Bypasser Pro (WAF智能完整版)";
+    private final String extensionName = "403Pro";
 
     private JPanel mainPanel;
     private JTabbedPane tabs;
@@ -110,41 +110,19 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             "not login", "forbidden", "block", "waf", "illegal", "please login",
             "authentication failed", "missing authorization"
     );
-    // 新增：扩容版实战 WAF 指纹字典
     private final List<String> defaultWafFingerprints = Arrays.asList(
-            // === 国际主流 WAF ===
-            "Cloudflare: (?i)(Server: cloudflare|cf-ray:|cloudflare-nginx|__cfduid|cf-request-id)",
-            "Imperva/Incapsula: (?i)(Server: imperva|X-Iinfo|incap_ses|visid_incap)",
-            "AWS WAF: (?i)(x-amz-cf-id|Server: awselb|aws-waf)",
-            "Akamai: (?i)(Server: AkamaiGHost|Akamai-Host-Header|ak_bmsc)",
-            "F5 BIG-IP / ASM: (?i)(Server: BigIP|F5-TrafficShield|BIGipServer|TS01[a-zA-Z0-9]{6}=)",
-            "Fortinet FortiWeb: (?i)(FORTIWAF|FortiWeb|fortigate)",
-            "Citrix NetScaler: (?i)(ns_af=|citrix_ns_id|NetScaler)",
-            "Barracuda (梭子鱼): (?i)(Barracuda|barracuda_waf_cookie|barra_counter_session)",
-            "Sucuri: (?i)(Sucuri|X-Sucuri-ID|X-Sucuri-Cache)",
-            "Wallarm: (?i)(Server: nginx-wallarm)",
-            "ModSecurity: (?i)(Mod_Security|NOYB|ModSecurity)",
-
-            // === 国内云厂商 WAF ===
-            "阿里云盾 (AliYun): (?i)(errors\\.aliyun\\.com|yundun|Server: AliyunOS)",
-            "腾讯云 WAF: (?i)(TencentWAF|X-Tencent-Ua|waf\\.tencent-cloud\\.com)",
-            "华为云 WAF (Huawei): (?i)(HWWAF|HuaWeiCloudWAF|HwWaf)",
-            "百度云加速 (Yunjiasu): (?i)(yunjiasu-nginx|Yunjiasu|X-Server: yunjiasu)",
-            "火山引擎 (ByteDance): (?i)(volcengine|bytedance-waf)",
-            "七牛云 WAF: (?i)(X-Qiniu-|qiniu-waf)",
-            "UCloud WAF: (?i)(UCloudWAF|ucloud-waf)",
-            "网宿科技 (Wangsu): (?i)(Cdn Cache Server|WSCDN)",
-
-            // === 国内传统/硬件安全厂商 ===
-            "长亭 SafeLine: (?i)(safeline|SafeLine)",
-            "安全狗 (SafeDog): (?i)(WAF/2\\.0|Safedog|safedog-flow-item|404\\.safedog\\.cn)",
-            "360 奇安信/安天: (?i)(wangzhan\\.360\\.cn|X-Powered-By-360WZB|360wzws)",
-            "知道创宇 (创宇盾): (?i)(X-Cache: jiasule|ks-waf|加速乐)",
-            "深信服 (Sangfor): (?i)(Sangfor|SANGFOR|X-Sangfor)",
-            "绿盟 (NSFOCUS): (?i)(NSFocus|nsfocus|Nsfoucs)",
-            "安恒 (DBApp): (?i)(dbappwaf|dbappsec)",
-            "D盾 (D-Shield): (?i)(D!Gite|D-x-WEB)",
-            "玄武盾 (XuanWu): (?i)(xuanwudun)"
+            "Cloudflare: (?i)(Server: cloudflare|cf-ray:|cloudflare-nginx)",
+            "阿里云盾: (?i)(errors\\.aliyun\\.com|yundun|Server: AliyunOS)",
+            "腾讯云WAF: (?i)(TencentWAF)",
+            "长亭SafeLine: (?i)(safeline)",
+            "安全狗: (?i)(WAF/2\\.0|Safedog|safedog-flow-item)",
+            "Imperva: (?i)(Server: imperva|X-Iinfo|incap_ses)",
+            "AWS WAF: (?i)(x-amz-cf-id|Server: awselb)",
+            "Akamai: (?i)(Server: AkamaiGHost)",
+            "F5 BIG-IP: (?i)(Server: BigIP|F5-TrafficShield)",
+            "360奇安信: (?i)(wangzhan\\.360\\.cn|X-Powered-By-360WZB)",
+            "创宇盾: (?i)(X-Cache: jiasule|ks-waf)",
+            "ModSecurity: (?i)(Mod_Security|NOYB)"
     );
 
     // --- WAF 智能引擎数据结构 ---
